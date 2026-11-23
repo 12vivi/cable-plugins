@@ -71,7 +71,16 @@ jobs:
         working-directory: synth
         run: |
           uv venv .venv --seed --python 3.12
-          uv pip install --python .venv -r requirements-dev.txt -e sdk/python
+          # Core 不再自带插件的进程内依赖（各插件在 requirements.inprocess.txt 里自己声明）；依赖声明检查、
+          # 类型检查与插件测试都要导入它们，所以和 Core 的开发依赖装进同一个环境。插件自带的 wheels/ 作为 find-links。
+          inprocess=()
+          for file in ../extra/plugins/*/requirements.inprocess.txt; do
+            if [ -f "$file" ]; then inprocess+=(-r "$file"); fi
+          done
+          for folder in ../extra/plugins/*/wheels; do
+            if [ -d "$folder" ]; then inprocess+=(--find-links "$folder"); fi
+          done
+          uv pip install --python .venv -r requirements-dev.txt -e sdk/python "${inprocess[@]}"
           echo "$SYNTH_DIR/.venv/bin" >> "$GITHUB_PATH"
           npm ci --ignore-scripts
 
