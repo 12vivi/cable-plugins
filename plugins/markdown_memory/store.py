@@ -190,6 +190,42 @@ class MarkdownProfileStore:
     def write_ops(self, source_ref: str, payload: dict[str, object]) -> dict[str, object]:
         return self._write_once(source_ref, "markdown_ops_v1", payload)
 
+    # 空闲提炼的操作与"这些消息已学过"同一事务提交：崩溃后要么都在（启动时重放 draft），要么都不在（下次重学）。
+    def write_idle_draft(self, source_ref: str, payload: dict[str, object], *,
+                         session_key: str, message_ids: tuple[str, ...]) -> None:
+        if not message_ids:
+            raise ValueError("空闲提炼必须覆盖至少一条消息")
+        self._write_once_many(source_ref, (
+            ("markdown_ops_v1", payload),
+            ("markdown_idle_learned_v1", {"session_key": session_key, "message_ids": list(message_ids)}),
+        ), learned=(session_key, message_ids))
+
+    # 连续失败已停止重试的空闲来源：记为已处理，不再反复提炼；原消息保留。
+    def skip_idle(self, source_ref: str, *, session_key: str, message_ids: tuple[str, ...]) -> None:
+        with closing(sqlite3.connect(str(self.receipts_path), timeout=30.0)) as conn, conn:
+            _ = conn.executemany(
+                "INSERT OR IGNORE INTO idle_learned (session_key, message_id, source_ref) VALUES (?, ?, ?)",
+                [(session_key, message_id, source_ref) for message_id in message_ids],
+            )
+
+    def idle_learned(self, session_key: str) -> frozenset[str]:
+        with closing(sqlite3.connect(str(self.receipts_path), timeout=30.0)) as conn:
+            rows = conn.execute("SELECT message_id FROM idle_learned WHERE session_key=?", (session_key,)).fetchall()
+        return frozenset(str(row[0]) for row in rows)
+
+    def read_idle_checked(self) -> dict[str, int]:
+        with closing(sqlite3.connect(str(self.receipts_path), timeout=30.0)) as conn:
+            rows = conn.execute("SELECT session_key, seq FROM idle_checked").fetchall()
+        return {str(session_key): int(seq) for session_key, seq in rows}
+
+    def save_idle_checked(self, session_key: str, seq: int) -> None:
+        with closing(sqlite3.connect(str(self.receipts_path), timeout=30.0)) as conn, conn:
+            _ = conn.execute(
+                "INSERT INTO idle_checked (session_key, seq) VALUES (?, ?) "
+                "ON CONFLICT(session_key) DO UPDATE SET seq=excluded.seq",
+                (session_key, seq),
+            )
+
     def is_applied(self, source_ref: str) -> bool:
         return (self._read_receipt(source_ref, "markdown_ops_applied_v1") is not None
                 or self._legacy_applied(source_ref))
@@ -238,8 +274,9 @@ class MarkdownProfileStore:
         draft = self.read_draft(source_ref)
         if draft is None:
             raise RuntimeError(f"Markdown 操作 draft 缺失: {source_ref}")
-        # 提炼 draft 必须带会话进度；整理 draft 不推进任何会话进度。
+        # 提炼 draft 必须带会话进度（摘要顺序或空闲已学记录）；整理 draft 不推进任何会话进度。
         if (self._read_receipt(source_ref, "markdown_projection_order_v1") is None
+                and self._read_receipt(source_ref, "markdown_idle_learned_v1") is None
                 and not source_ref.startswith("consolidation:")):
             raise RuntimeError(f"Markdown 提炼 draft 缺少会话进度，拒绝应用: {source_ref}")
         scope = draft.get("scope")
@@ -332,6 +369,18 @@ class MarkdownProfileStore:
                     updated_at TEXT NOT NULL,
                     source_ref TEXT NOT NULL,
                     PRIMARY KEY (doc, line_hash)
+                )""")
+            # 空闲提炼已学过（或已放弃）的消息：摘要路径据此跳过，两条路径不重复学同一 Turn。
+            _ = conn.execute("""CREATE TABLE IF NOT EXISTS idle_learned (
+                    session_key TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    source_ref TEXT NOT NULL,
+                    PRIMARY KEY (session_key, message_id)
+                )""")
+            # 空闲检查已看过的会话 head；只可能落后，落后只会多检查一次。
+            _ = conn.execute("""CREATE TABLE IF NOT EXISTS idle_checked (
+                    session_key TEXT PRIMARY KEY,
+                    seq INTEGER NOT NULL
                 )""")
             conn.commit()
         self._backfill_entry_timestamps()
@@ -551,8 +600,9 @@ class MarkdownProfileStore:
         self._write_once_many(source_ref, ((kind, payload),))
         return dict(payload)
 
-    # 同一事务写入多条 receipt；已存在的必须与本次内容一致。
-    def _write_once_many(self, source_ref: str, items: tuple[tuple[str, dict[str, object]], ...]) -> None:
+    # 同一事务写入多条 receipt；已存在的必须与本次内容一致。learned 给出时，同一事务记下空闲提炼覆盖的消息。
+    def _write_once_many(self, source_ref: str, items: tuple[tuple[str, dict[str, object]], ...], *,
+                         learned: tuple[str, tuple[str, ...]] | None = None) -> None:
         with closing(sqlite3.connect(str(self.receipts_path), timeout=30.0)) as conn:
             _ = conn.execute("BEGIN IMMEDIATE")
             for kind, payload in items:
@@ -571,6 +621,12 @@ class MarkdownProfileStore:
                     "(source_ref, kind, payload, trailing_blank_line, done_at) "
                     "VALUES (?, ?, ?, 0, datetime('now'))",
                     (source_ref, kind, encoded),
+                )
+            if learned is not None:
+                session_key, message_ids = learned
+                _ = conn.executemany(
+                    "INSERT OR IGNORE INTO idle_learned (session_key, message_id, source_ref) VALUES (?, ?, ?)",
+                    [(session_key, message_id, source_ref) for message_id in message_ids],
                 )
             conn.commit()
 
