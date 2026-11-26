@@ -392,9 +392,10 @@ PINNED_CHARS = 4000
 
 
 # 常驻记忆：使用规则、两份档案、当前 scope 与全局主题的 pinned 全文和自动索引、其他文件夹清单。
-def render_memory(root: str, workspace: Workspace, others: Mapping[str, str]) -> str:
+def render_memory(root: str, workspace: Workspace, others: Mapping[str, str], *,
+                  extract_idle_minutes: int = 0) -> str:
     folder = workspace.folder()
-    parts = [_usage(root, workspace.scope, folder)]
+    parts = [_usage(root, workspace.scope, folder, extract_idle_minutes)]
     for title, doc in (("Cable 自我认知", SELF), ("用户长期记忆", MEMORY)):
         if text := workspace.texts.get(doc, "").strip():
             parts.append(f"## {title}（{doc}）\n\n{text}")
@@ -434,7 +435,9 @@ def _topics(texts: Mapping[str, str], prefix: str) -> str:
     return "\n\n".join([*pinned, *(["索引：\n" + "\n".join(index)] if index else [])])
 
 
-def _usage(root: str, scope: str | None, folder: str | None) -> str:
+def _usage(root: str, scope: str | None, folder: str | None, extract_idle_minutes: int = 0) -> str:
+    when = (f"对话停下约 {extract_idle_minutes} 分钟后、以及上下文压缩后" if extract_idle_minutes > 0
+            else "上下文压缩后")
     if scope is None:
         where = "当前会话不属于任何项目：项目相关内容写进全局主题。"
     elif folder is None:
@@ -449,7 +452,7 @@ def _usage(root: str, scope: str | None, folder: str | None) -> str:
 读：这里只有档案、pinned 主题和索引。需要某个主题时用 read_file 读完整文件；找不到或要看其他项目时，用 shell 在记忆目录执行 rg。记忆记的是写下当时的情况，不是当前状态的证明：凡涉及路径、端口、版本、配置、服务或额度等易漂移事实，先对照实际文件或命令核实再依赖；与眼前看到的不一致时以眼前为准，并更新或删掉过时的条目。
 回忆过去的事时，先在档案、浮现的主题和召回的历史里找依据，只用与当前问题真正相关的条目；预览不够就读原文。找不到依据就直说记不清，或者去查，不要凭印象补全细节。
 
-写：直接用 write_file / edit_file 编辑文件。用户要求记住时立即写；要求忘记时删除对应条目；用户纠正你的做法、或明确认可某种做法时，也当场记下。后台也会在上下文压缩后自动提炼，其余内容不必为了保险重复写。
+写：直接用 write_file / edit_file 编辑文件。用户要求记住时立即写；要求忘记时删除对应条目；用户纠正你的做法、或明确认可某种做法时，也当场记下。后台也会在{when}自动提炼，其余内容不必为了保险重复写。
 - 用户本人的身份、处境、偏好、明确要求 → MEMORY.md 对应标题下。
 - 用户对你说话方式、做事方式的反馈（纠正和认可都算）→ 通用的写 MEMORY.md「用户偏好」，只对本项目适用的写项目文件夹；写成以后怎么做，并带上原因。
 - 用户的计划、日程与约定（包括你答应用户的事）→ 相关主题文件，写明具体日期。

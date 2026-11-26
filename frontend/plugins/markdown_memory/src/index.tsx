@@ -8,6 +8,7 @@ export function activate(ctx: WebHostContextV1) {
     fields: ({values, change, status}) => <>
       <ModelField label="整理记忆的模型" name="model" value={values.model} change={change} status={status} hint="提炼、合并与精简记忆时使用，都在对话之外的后台进行" />
       <Field label="用户记忆篇幅（字）" name="memory_budget" type="number" inputMode="numeric" min={1} step={1} value={values.memory_budget} fallback={status.defaults?.memory_budget} change={change} hint="MEMORY.md 三个用户章节合计；超出时会合并精简旧条目" />
+      <Field label="对话停下多久后提炼（分钟）" name="extract_idle_minutes" type="number" inputMode="numeric" min={0} step={1} value={values.extract_idle_minutes} fallback={status.defaults?.extract_idle_minutes} change={change} hint="对话停下这么久后，把还没记下的内容提炼进长期记忆；填 0 只在上下文压缩后提炼" />
       <Field label="每轮最多浮现的主题文档" name="surface_limit" type="number" inputMode="numeric" min={0} step={1} value={values.surface_limit} fallback={status.defaults?.surface_limit} change={change} hint="和当前话题相关的主题文档会自动带进上下文；填 0 关闭" />
       <details><summary>浮现与整理</summary>
         <Field label="浮现的最低相关度" name="surface_min_score" type="number" inputMode="decimal" min={0} step="any" value={values.surface_min_score} fallback={status.defaults?.surface_min_score} change={change} hint="调高只带最相关的文档" />
