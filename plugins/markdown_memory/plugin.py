@@ -667,10 +667,16 @@ def _unit_relevance(query: Sequence[float], units: Mapping[str, tuple[str, ...]]
         vector = vectors.get(content_digest(text))
         return None if vector is None else math.sumprod(query, vector) / (scale * norm(vector))
 
-    similarities = {(doc, index): value for doc, values in units.items() for index, text in enumerate(values)
-                    if (value := cosine(text)) is not None}
-    anchors = tuple(value for text in ANCHORS if (value := cosine(text)) is not None)
-    _baseline, scaled = relevance(similarities, anchors)
+    similarities: dict[tuple[str, int], float] = {}
+    for doc, values in units.items():
+        for index, text in enumerate(values):
+            if (value := cosine(text)) is not None:
+                similarities[(doc, index)] = value
+    anchors: list[float] = []
+    for text in ANCHORS:
+        if (value := cosine(text)) is not None:
+            anchors.append(value)
+    _baseline, scaled = relevance(similarities, tuple(anchors))
     return {doc: tuple(scaled.get((doc, index), 0.0) for index in range(len(values))) for doc, values in units.items()}
 
 
