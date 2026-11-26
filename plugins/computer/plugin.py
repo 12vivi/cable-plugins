@@ -168,7 +168,7 @@ workspace_files = ()
 # 静态声明供安装侧不执行插件就能预拉镜像；运行时注册的镜像必须与它一致。
 images = (
     "ghcr.io/12vivi/cable-computer@"
-    "sha256:dd107c74c91d5778ebdc130f1c26828638f8c53e142c69771f4feb858b67f054",
+    "sha256:a5ac7b26c6da0cff14a2de13351426b7e34757e140979c4e750ae50ef8b4b6a4",
 )
 _IMAGE = images[0]
 
