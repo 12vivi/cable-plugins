@@ -2,107 +2,23 @@
 import asyncio
 from contextlib import closing
 from datetime import UTC, datetime
-import json
 from pathlib import Path
 import re
-import shutil
 import sqlite3
 
 import pytest
 
-from agent.plugin_composition import ServiceKey
 from plugins.channels.contract import CHANNEL_INPUT_V2 as CHANNEL_INPUT, ChannelInboundMessage
-from plugins.content.plugin import check_text
 from plugins.context.contract import MATERIALS_V4 as MATERIALS
-from plugins.ledger.contract import ContentPart, Input, Output
+from plugins.ledger.contract import ContentPart, Output
 from plugins.ledger.log import SessionAttributes
+from tests.markdown_memory.harness import (
+    add_markdown_memory, append_turn, eventually, markdown_requests, source_ids,
+)
 from tests.test_default_reply import application
 
-MARKDOWN_PROMPT = "你维护 Cable 的长期 Markdown 记忆"
-
-
-def add_markdown_memory(idle_minutes: int, *, unit_seconds: int = 0):
-    """安装真实 markdown_memory；只把空闲时钟缩到测试尺度（一"分钟"= unit_seconds 秒），并在模型边界按来源原文回答。"""
-    def install(sources: Path) -> None:
-        target = sources / "markdown_memory"
-        shutil.copytree(Path(__file__).parents[2] / "plugins/markdown_memory", target,
-                        ignore=shutil.ignore_patterns("__pycache__"))
-        module = target / "plugin.py"
-        text = module.read_text(encoding="utf-8")
-        for old, new in (("_IDLE_SWEEP_SECONDS = 60.0", "_IDLE_SWEEP_SECONDS = 0.05"),
-                         ("_IDLE_SWEEP_INITIAL_DELAY_SECONDS = 15.0", "_IDLE_SWEEP_INITIAL_DELAY_SECONDS = 0.0"),
-                         ("_IDLE_UNIT_SECONDS = 60", f"_IDLE_UNIT_SECONDS = {unit_seconds}")):
-            assert old in text
-            text = text.replace(old, new)
-        module.write_text(text, encoding="utf-8")
-        from agent.plugin_composition.config_input import save_config
-        save_config(sources.parent / "workspace/plugin-data/markdown_memory-builtin",
-                    {"extract_idle_minutes": idle_minutes})
-        # 与发行版 bundle 相同：组合配置把 Prompt 贡献权授予 markdown_memory，摘要仍归 compaction。
-        save_config(sources.parent / "workspace/plugin-data/context-builtin", {
-            "summary_source": ["compaction", "compaction"],
-            "prompt_sources": {"markdown_memory": "markdown_memory"},
-        })
-        # agent 曾用不合规文件名写过的主题：后台照常给出参照，但必须标成只读。
-        topics = sources.parent / "workspace/memory/topics"
-        topics.mkdir(parents=True, exist_ok=True)
-        (topics / "My Notes.md").write_text("---\ndescription: 手写笔记\n---\n- 旧笔记\n", encoding="utf-8")
-        provider = sources / "test_provider/plugin.py"
-        source = provider.read_text(encoding="utf-8")
-        marker = 'if "[Source messages]" in str(request.messages):'
-        assert marker in source
-        provider.write_text(source.replace(
-            marker,
-            f'if {MARKDOWN_PROMPT!r} in str(request.messages):\n'
-            '                return markdown_reply(request)\n'
-            f'            {marker}',
-        ) + '''
-
-def markdown_reply(request):
-    """按本批来源原文给出操作：只有提到乌龙茶的那轮值得记，其余返回空操作。"""
-    import json
-    prompt = "".join(str(message["content"]) for message in request.messages)
-    rows = json.loads(prompt.split("本次精确来源：\\n", 1)[1])
-    users = [row for row in rows if row["author"] == "user" and "乌龙茶" in json.dumps(row, ensure_ascii=False)]
-    if not users:
-        return LLMResponse(json.dumps({"ops": []}))
-    reply = next(row for row in rows[rows.index(users[0]):] if row["author"] == "assistant")
-    day = users[0]["at"][:10]
-    return LLMResponse(json.dumps({"ops": [
-        {"op": "add", "doc": "MEMORY.md", "section": "## 用户偏好", "line": "- 爱喝乌龙茶",
-         "message_ids": [users[0]["message_id"]]},
-        {"op": "create", "doc": "topics/出行计划.md", "description": "用户的出行与日程安排",
-         "line": "- " + day + " 那周的周三去上海出差；Cable 答应前一天提醒收拾行李",
-         "message_ids": [users[0]["message_id"], reply["message_id"]]},
-    ]}, ensure_ascii=False))
-''', encoding="utf-8")
-    return install
-
-
-def append_turn(log, session: str, suffix: str, question: str, answer: str) -> None:
-    log.writer(session, author="user", source="conversation", body_types=(Input,),
-               content={"text": check_text}).append(f"{session}-u{suffix}", Input((ContentPart("text", question),)))
-    log.writer(session, author="assistant", source="conversation", body_types=(Output,),
-               content={"text": check_text}).append(
-        f"{session}-a{suffix}", Output((ContentPart("text", answer),), "complete"))
-
-
-async def eventually(check, *, timeout: float = 10.0) -> None:
-    deadline = asyncio.get_running_loop().time() + timeout
-    while not check():
-        if asyncio.get_running_loop().time() > deadline:
-            raise AssertionError("等待超时")
-        await asyncio.sleep(0.05)
-
-
-def markdown_requests(host) -> list[str]:
-    calls = host.live_root.context.require(ServiceKey("fixture.calls"))
-    prompts = ["".join(str(message["content"]) for message in call.messages) for call in calls]
-    return [prompt for prompt in prompts if MARKDOWN_PROMPT in prompt]
-
-
-def source_ids(prompt: str) -> list[str]:
-    return [row["message_id"] for row in json.loads(prompt.split("本次精确来源：\n", 1)[1])]
+# agent 曾用不合规文件名写过的主题：后台照常给出参照，但必须标成只读。
+MY_NOTES = {"My Notes.md": "\n".join(("---", "description: 手写笔记", "---", "- 旧笔记", ""))}
 
 
 @pytest.mark.asyncio
@@ -110,7 +26,7 @@ async def test_idle_conversation_is_learned_once_without_compaction(tmp_path: Pa
     """MEM-002/MEM-011（空闲提炼）：没压缩过的短对话停下后也进长期记忆，学过的 Turn 不再送去提炼。"""
     memory = tmp_path / "workspace/memory"
     async with application(tmp_path, replying=False, compaction=True,
-                           extra_sources=add_markdown_memory(30)) as (log, host):
+                           extra_sources=add_markdown_memory(30, topics=MY_NOTES)) as (log, host):
         log.ensure_session("s1", SessionAttributes())
         append_turn(log, "s1", "1", "我最近爱喝乌龙茶，下周三要去上海出差", "好的，周二晚上提醒你收拾行李")
 
@@ -160,7 +76,7 @@ async def test_summary_and_idle_paths_never_learn_a_turn_twice(tmp_path: Path) -
     """MEM-004/MEM-011：长对话先被真实压缩摘要学走前段，停下后空闲提炼只补学摘要没覆盖的尾部。"""
     memory = tmp_path / "workspace/memory"
     async with application(tmp_path, replying=True, compaction=True,
-                           extra_sources=add_markdown_memory(3, unit_seconds=1)) as (log, host):
+                           extra_sources=add_markdown_memory(5, unit_seconds=1)) as (log, host):
         root = host.live_root
         assert root is not None
         accept = root.context.require(CHANNEL_INPUT)

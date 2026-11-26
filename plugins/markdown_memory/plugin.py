@@ -12,7 +12,8 @@ from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, AsyncGenerator, cast
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+import math
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -26,7 +27,7 @@ from agent.plugin_composition import (
     ServiceKey,
 )
 from plugins.models.contract import ModelRequest
-from plugins.models.contract import CHAT_MODELS, MODEL_CATALOG, ModelChoice, ModelUse, model_options
+from plugins.models.contract import CHAT_MODELS, EMBEDDINGS, MODEL_CATALOG, ModelChoice, ModelUse, model_options
 from plugins.ledger.contract import BINDINGS, Bindings
 from plugins.ledger.contract import MESSAGE_CATALOG
 from plugins.models.contract import LLMResponse
@@ -66,10 +67,10 @@ from plugins.runtime_inspection.contract import DOCUMENTS, Document
 from .documents import (
     MEMORY, SELF, SELF_HEADINGS, MEMORY_HEADINGS, InvalidDraft, Op, Workspace,
     SCOPE_FILE, TOPICS, broken_wiki_links, budget_usage, check_budgets, expand_linked_topics,
-    extract_wiki_links, parse_ops, rank, render_memory, resolve_wiki_link, section_of, split_frontmatter, surfaceable,
-    writable,
+    extract_wiki_links, parse_ops, render_memory, resolve_wiki_link, section_of, split_frontmatter, surfaceable,
+    writable, ANCHORS, Surfaceable, choose, lexical, pick_rows, relevance, row_matches,
 )
-from .store import DEFAULT_SELF_MD, ConcurrentChange, MarkdownProfileStore
+from .store import DEFAULT_SELF_MD, ConcurrentChange, MarkdownProfileStore, content_digest
 
 logger = logging.getLogger("plugins.markdown_memory")
 # 日志去重状态：同一对象同一原因只打一次。
@@ -94,13 +95,18 @@ inject = (PLUGIN_CONFIG, CHAT_MODELS, MODEL_CATALOG, MATERIALS_V4, BINDINGS, MES
 
 
 SETTINGS = ServiceKey[Configuration]("markdown_memory.settings.v1")
-SETTING_FIELDS = ("model", "memory_budget", "extract_idle_minutes", "surface_limit", "surface_min_score", "surface_chars",
+SETTING_FIELDS = ("model", "memory_budget", "extract_idle_minutes", "surface_limit", "surface_min_relevance",
+                  "surface_min_score", "surface_chars",
                   "consolidate", "consolidate_hours", "consolidate_min_drafts")
 # 空闲提炼：每分钟看一次各会话是否已停下；只补学最近几天还有对话的会话，升级时不回溯整段历史。
 _IDLE_SWEEP_SECONDS = 60.0
 _IDLE_SWEEP_INITIAL_DELAY_SECONDS = 15.0
 _IDLE_UNIT_SECONDS = 60
 _IDLE_MAX_SESSION_AGE_DAYS = 7
+# 每篇浮现主题最多展示的条目数；其余提示用 read_file 读。
+_SURFACE_ENTRIES = 6
+# 每轮最多新算这么多条目向量（参照句优先），大量既有主题分几轮补齐，不让一次输入久等。
+_SURFACE_EMBED_LIMIT = 32
 
 
 # 提炼、合并与精简都在对话之外的后台跑，只能跟随默认或指定模型。
@@ -115,6 +121,8 @@ class Config(BaseModel):
     extract_idle_minutes: int = Field(default=30, ge=0)
     self_budgets: dict[str, int] = Field(default_factory=lambda: dict(zip(SELF_HEADINGS[1:], (800, 600, 300))))
     surface_limit: int = Field(default=3, ge=0)
+    # 向量通道：条目相对本次查询无关水平的相关度（0～1）过线才浮现；关键词通道仍用 surface_min_score。
+    surface_min_relevance: float = Field(default=0.3, ge=0, le=1)
     surface_min_score: float = Field(default=2.0, ge=0)
     surface_chars: int = Field(default=4000, ge=1)
     consolidate: bool = True
@@ -619,25 +627,51 @@ def _consolidation_prompt(
 
 def _surfaced_text(
     docs: list[str],
-    texts: Mapping[str, str],
+    candidates: Mapping[str, Surfaceable],
+    scores: Mapping[str, tuple[float, ...]],
     ages: Mapping[str, int],
     limit: int,
     entry_dates: Mapping[str, Mapping[str, str]] = {},
+    *,
+    floor: float = 1.0,
 ) -> str:
+    """每篇只给与本条消息最相关的几条条目（按文件原顺序），其余条目提示用 read_file 读。"""
     parts = ["## 相关记忆（按本条消息自动浮现的 Markdown 主题；只用与当前问题相关的条目，可能过时，依赖前先核实）"]
     for doc in docs:
-        dates = entry_dates.get(doc, {})
-        lines = [
-            f"{row} （记录于 {dates[row]}）"
-            if row.startswith("- ") and row in dates and dates[row] not in row
-            else row
-            for row in split_frontmatter(texts[doc])[1]
-        ]
-        body = "\n".join(lines).strip()
+        item = candidates[doc]
         age = ages.get(doc, 0)
-        parts.append(f"### {doc}（{'今天' if age == 0 else f'{age} 天前'}更新）\n"
-                     + (body if len(body) <= limit else body[:limit] + "\n（已截断，完整内容用 read_file 读取）"))
+        header = f"### {doc}（{'今天' if age == 0 else f'{age} 天前'}更新）" + (f"：{item.description}" if item.description else "")
+        if not item.rows:
+            body = item.body if len(item.body) <= limit else item.body[:limit] + "\n（已截断，完整内容用 read_file 读取）"
+            parts.append(f"{header}\n{body}".rstrip())
+            continue
+        dates = entry_dates.get(doc, {})
+        rows = pick_rows(item.rows, scores.get(doc) or (0.0,) * len(item.rows), floor=floor, chars=limit,
+                         entries=_SURFACE_ENTRIES)
+        shown = [f"{row} （记录于 {dates[row]}）" if row in dates and dates[row] not in row else row for row in rows]
+        rest = len(item.rows) - len(rows)
+        parts.append("\n".join((header, *shown, *((f"（另有 {rest} 条未展示，需要时用 read_file 读取完整文件）",) if rest else ()))))
     return "\n\n".join(parts)
+
+
+def _unit_relevance(query: Sequence[float], units: Mapping[str, tuple[str, ...]],
+                    vectors: Mapping[str, Sequence[float]]) -> dict[str, tuple[float, ...]]:
+    """余弦相似度换成相对参照句与全部单元中位数的相关度；按篇返回各单元（首个为文件名与描述）。
+    还没算出向量的单元记 0，不参与基线，留给关键词通道。"""
+    def norm(vector: Sequence[float]) -> float:
+        return math.sqrt(math.sumprod(vector, vector)) or 1.0
+
+    scale = norm(query)
+
+    def cosine(text: str) -> float | None:
+        vector = vectors.get(content_digest(text))
+        return None if vector is None else math.sumprod(query, vector) / (scale * norm(vector))
+
+    similarities = {(doc, index): value for doc, values in units.items() for index, text in enumerate(values)
+                    if (value := cosine(text)) is not None}
+    anchors = tuple(value for text in ANCHORS if (value := cosine(text)) is not None)
+    _baseline, scaled = relevance(similarities, anchors)
+    return {doc: tuple(scaled.get((doc, index), 0.0) for index in range(len(values))) for doc, values in units.items()}
 
 
 def _surfaced_reminders(text: str) -> tuple[Mapping[str, object], ...]:
@@ -981,6 +1015,32 @@ async def apply(ctx: Context) -> None:
     root = ctx.workspace_root("memory")
     frozen: dict[tuple[str, str], MaterialData] = {}
     surfaced: dict[str, tuple[Mapping[str, object], ...]] = {}
+    # 浮现的向量通道：有 embedding provider 时由子 Fiber 挂上（空间身份, 向量化），provider 离开时撤下。
+    surface_embeddings: list[tuple[Callable[[], Awaitable[tuple[str, int]]],
+                                   Callable[[str, list[str]], Awaitable[tuple[tuple[float, ...], ...]]]]] = []
+    embedding_degraded: list[str] = []
+
+    async def attach_embeddings(child: Context) -> None:
+        async def space() -> tuple[str, int]:
+            async with child.runtime_scope():
+                descriptor = child.require(EMBEDDINGS).describe()
+                return descriptor.identity, descriptor.dimensions
+
+        async def embed(expected: str, texts: list[str]) -> tuple[tuple[float, ...], ...]:
+            async with child.runtime_scope():
+                service = child.require(EMBEDDINGS)
+                async with service.bind(model_id=service.describe().model_id) as model:
+                    if model.descriptor.identity != expected:
+                        raise ModelUnavailableError("embedding 空间在本次浮现中途变化").exception()
+                    result = await model.embed(texts)
+                return tuple(tuple(float(value) for value in vector) for vector in result.vectors)
+
+        def attach() -> Callable[[], None]:
+            surface_embeddings[:] = [(child.entrypoint(space), child.entrypoint(embed))]
+            return surface_embeddings.clear
+        await child.effect(attach, label="surface-embeddings")
+
+    await ctx.inject((EMBEDDINGS,), attach_embeddings, name="surface-embeddings")
 
     async def prepare(snapshot: tuple[Message, ...], source: str) -> MaterialData:
         # 1. 快照按 会话 + 最新压缩摘要 冻结：同一压缩代内前缀稳定，agent 写入下一代才可见。
@@ -1034,16 +1094,67 @@ async def apply(ctx: Context) -> None:
             workspace, seen = await run_file_io(
                 lambda: (current.workspace(scope), current.read_surfaced_docs(committed_ids)),
             )
-        candidates = {doc: text for doc, text in surfaceable(workspace.texts, workspace.folder()).items()
+        candidates = {doc: item for doc, item in surfaceable(workspace.texts, workspace.folder()).items()
                       if doc not in seen}
-        docs = [doc for doc, score in rank(query, candidates) if score >= config.surface_min_score]
-        docs = expand_linked_topics(
-            docs[:config.surface_limit], candidates, workspace.texts, workspace.folder(), limit=config.surface_limit,
-        )
+        docs: list[str] = []
+        scores: dict[str, tuple[float, ...]] = {}
+        dense: dict[str, tuple[float, ...]] | None = None
+        if candidates and query.strip():
+            # 关键词与向量两路：向量通道让换个说法、中英混用也能想起来；不可用时只用关键词。
+            words = await run_file_io(lambda: lexical(query, {doc: item.text() for doc, item in candidates.items()}))
+            dense = await dense_relevance(query, candidates, current)
+            docs = choose(None if dense is None else {doc: max(values) for doc, values in dense.items()}, words,
+                          limit=config.surface_limit, min_relevance=config.surface_min_relevance,
+                          min_score=config.surface_min_score)
+            docs = expand_linked_topics(docs, candidates, workspace.texts, workspace.folder(), limit=config.surface_limit)
+            # 每篇展示哪几条：向量通道按条目相关度，关键词通道按条目命中的词数。
+            scores = {doc: dense[doc][1:] if dense is not None else row_matches(query, candidates[doc].rows)
+                      for doc in docs}
         ages, dates = await run_file_io(lambda: (current.ages_days(docs), current.entry_dates(docs)))
-        text = _surfaced_text(docs, workspace.texts, ages, config.surface_chars, dates) if docs else ""
+        # 条目过线：向量通道取浮现门槛的一半（高于本次无关水平），关键词通道至少命中一个词。
+        floor = config.surface_min_relevance / 2 if dense is not None else 1.0
+        text = _surfaced_text(docs, candidates, scores, ages, config.surface_chars, dates, floor=floor) if docs else ""
         await run_file_io(lambda: current.save_surfaced(user.message_id, docs, text))
         return remember_surfaced(user.message_id, _surfaced_reminders(text))
+
+    def note_embedding(reason: str | None) -> None:
+        """向量通道进入或离开降级时各记一条日志；持续降级不重复。"""
+        if reason is None:
+            if embedding_degraded:
+                logger.info("[resumed] Markdown 浮现的向量通道已恢复")
+                embedding_degraded.clear()
+        elif not embedding_degraded:
+            logger.warning("[degraded] Markdown 浮现的向量通道不可用，暂时只按关键词浮现: %s", reason)
+            embedding_degraded.append(reason)
+
+    async def dense_relevance(query: str, candidates: Mapping[str, Surfaceable],
+                              current: MarkdownProfileStore) -> dict[str, tuple[float, ...]] | None:
+        """每篇每个检索单元相对本次查询无关水平的相关度；没有 embedding 或暂时不可用时返回 None。"""
+        if not surface_embeddings:
+            return None
+        space, embed = surface_embeddings[0]
+        units = {doc: item.units() for doc, item in candidates.items()}
+        texts = tuple(dict.fromkeys((*ANCHORS, *(unit for values in units.values() for unit in values))))
+        digests = tuple(content_digest(text) for text in texts)
+        try:
+            identity, dimensions = await space()
+            cached = await run_file_io(lambda: current.read_vectors(identity, dimensions, digests))
+            missing = [text for text, digest in zip(texts, digests) if digest not in cached][:_SURFACE_EMBED_LIMIT]
+            vectors = await embed(identity, [query, *missing])
+        except (RuntimeError, TimeoutError) as error:
+            # 外部 embedding 失败可以降级；缓存读取、形状错误与取消照常传播（MEM-006）。
+            if not isinstance(error, (CompositionError, TimeoutError)) and ModelError.read(error) is None:
+                raise
+            note_embedding(f"{type(error).__name__}: {error}")
+            return None
+        if len(vectors) != 1 + len(missing) or any(len(vector) != dimensions for vector in vectors):
+            raise ValueError("embedding 返回的数量或维度与请求不一致")
+        fresh = {content_digest(text): vector for text, vector in zip(missing, vectors[1:])}
+        if fresh:
+            await run_file_io(lambda: current.save_vectors(identity, fresh))
+        note_embedding(None)
+        table = {**cached, **fresh}
+        return await run_file_io(lambda: _unit_relevance(vectors[0], units, table))
 
     async def follow(catalog: MessageCatalog) -> None:
         """模型失败时保留原游标，关闭订阅后延时重读，其他会话继续处理。"""

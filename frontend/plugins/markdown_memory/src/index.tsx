@@ -11,7 +11,8 @@ export function activate(ctx: WebHostContextV1) {
       <Field label="对话停下多久后提炼（分钟）" name="extract_idle_minutes" type="number" inputMode="numeric" min={0} step={1} value={values.extract_idle_minutes} fallback={status.defaults?.extract_idle_minutes} change={change} hint="对话停下这么久后，把还没记下的内容提炼进长期记忆；填 0 只在上下文压缩后提炼" />
       <Field label="每轮最多浮现的主题文档" name="surface_limit" type="number" inputMode="numeric" min={0} step={1} value={values.surface_limit} fallback={status.defaults?.surface_limit} change={change} hint="和当前话题相关的主题文档会自动带进上下文；填 0 关闭" />
       <details><summary>浮现与整理</summary>
-        <Field label="浮现的最低相关度" name="surface_min_score" type="number" inputMode="decimal" min={0} step="any" value={values.surface_min_score} fallback={status.defaults?.surface_min_score} change={change} hint="调高只带最相关的文档" />
+        <Field label="语义浮现的最低相关度（0–1）" name="surface_min_relevance" type="number" inputMode="decimal" min={0} max={1} step="any" value={values.surface_min_relevance} fallback={status.defaults?.surface_min_relevance} change={change} hint="按意思匹配主题（需要配置 embedding 模型）；调高只带最相关的" />
+        <Field label="关键词浮现的最低分" name="surface_min_score" type="number" inputMode="decimal" min={0} step="any" value={values.surface_min_score} fallback={status.defaults?.surface_min_score} change={change} hint="按字面匹配主题，至少命中两个不同的词；调高只带最相关的" />
         <Field label="浮现内容字数上限" name="surface_chars" type="number" inputMode="numeric" min={1} step={1} value={values.surface_chars} fallback={status.defaults?.surface_chars} change={change} />
         <Check label="定期整理" name="consolidate" value={values.consolidate} fallback={status.defaults?.consolidate} change={change} hint="把重复或相互矛盾的旧条目合并为一条，不引入新事实" />
         <Field label="整理间隔（小时）" name="consolidate_hours" type="number" inputMode="numeric" min={1} step={1} value={values.consolidate_hours} fallback={status.defaults?.consolidate_hours} change={change} />

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from array import array
 import hashlib
 import json
 import logging
+import math
 import sqlite3
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
@@ -213,6 +215,41 @@ class MarkdownProfileStore:
             rows = conn.execute("SELECT message_id FROM idle_learned WHERE session_key=?", (session_key,)).fetchall()
         return frozenset(str(row[0]) for row in rows)
 
+    # 已缓存的浮现向量；损坏或维度不符必须报错，不能当作缺失后静默重算。
+    def read_vectors(self, space: str, dimensions: int, digests: tuple[str, ...]) -> dict[str, tuple[float, ...]]:
+        today = int(time.time() // 86400)
+        rows: list[tuple[str, object, int]] = []
+        with closing(sqlite3.connect(str(self.receipts_path), timeout=30.0)) as conn, conn:
+            for start in range(0, len(digests), 500):
+                chunk = digests[start:start + 500]
+                marks = ",".join("?" for _ in chunk)
+                rows += conn.execute(
+                    f"SELECT digest, vector, used_on FROM surface_vectors WHERE space=? AND digest IN ({marks})",
+                    (space, *chunk),
+                ).fetchall()
+            stale = [(today, space, digest) for digest, _vector, used_on in rows if used_on < today]
+            if stale:
+                _ = conn.executemany("UPDATE surface_vectors SET used_on=? WHERE space=? AND digest=?", stale)
+        result: dict[str, tuple[float, ...]] = {}
+        for digest, blob, _used_on in rows:
+            if not isinstance(blob, bytes) or len(blob) != dimensions * 4:
+                raise ValueError(f"Markdown 浮现向量缓存损坏: {digest}")
+            vector = array("f")
+            vector.frombytes(blob)
+            if not all(math.isfinite(value) for value in vector):
+                raise ValueError(f"Markdown 浮现向量含非有限值: {digest}")
+            result[digest] = tuple(vector)
+        return result
+
+    def save_vectors(self, space: str, vectors: Mapping[str, Sequence[float]]) -> None:
+        today = int(time.time() // 86400)
+        with closing(sqlite3.connect(str(self.receipts_path), timeout=30.0)) as conn, conn:
+            _ = conn.executemany(
+                "INSERT OR REPLACE INTO surface_vectors (space, digest, vector, used_on) VALUES (?, ?, ?, ?)",
+                [(space, digest, array("f", vector).tobytes(), today) for digest, vector in vectors.items()],
+            )
+            _ = conn.execute("DELETE FROM surface_vectors WHERE used_on < ?", (today - 60,))
+
     def read_idle_checked(self) -> dict[str, int]:
         with closing(sqlite3.connect(str(self.receipts_path), timeout=30.0)) as conn:
             rows = conn.execute("SELECT session_key, seq FROM idle_checked").fetchall()
@@ -381,6 +418,14 @@ class MarkdownProfileStore:
             _ = conn.execute("""CREATE TABLE IF NOT EXISTS idle_checked (
                     session_key TEXT PRIMARY KEY,
                     seq INTEGER NOT NULL
+                )""")
+            # 浮现用的条目向量：可重算的派生缓存，按 embedding 空间与正文摘要寻址；久未使用的自动清掉。
+            _ = conn.execute("""CREATE TABLE IF NOT EXISTS surface_vectors (
+                    space TEXT NOT NULL,
+                    digest TEXT NOT NULL,
+                    vector BLOB NOT NULL,
+                    used_on INTEGER NOT NULL,
+                    PRIMARY KEY (space, digest)
                 )""")
             conn.commit()
         self._backfill_entry_timestamps()
