@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Hashable, Mapping
 from dataclasses import asdict, dataclass, field
 import math
 import re
-from typing import Literal, cast, get_args
+from typing import Literal, TypeVar, cast, get_args
 
 MEMORY = "MEMORY.md"
 SELF = "SELF.md"
@@ -496,7 +496,7 @@ def broken_wiki_links(texts: Mapping[str, str], folder: str | None, docs: tuple[
 
 def expand_linked_topics(
     primary: list[str],
-    candidates: Mapping[str, str],
+    candidates: Mapping[str, object],
     texts: Mapping[str, str],
     folder: str | None,
     *,
@@ -529,32 +529,115 @@ def terms(text: str) -> list[str]:
     return result
 
 
-def rank(query: str, docs: Mapping[str, str], *, k1: float = 1.2, b: float = 0.75) -> list[tuple[str, float]]:
-    bags = {doc: Counter(terms(text)) for doc, text in docs.items()}
-    if not bags:
-        return []
-    average = sum(sum(bag.values()) for bag in bags.values()) / len(bags) or 1.0
-    scores: dict[str, float] = {}
-    for term in set(terms(query)):
-        hits = [doc for doc, bag in bags.items() if term in bag]
-        idf = math.log(1 + (len(bags) - len(hits) + 0.5) / (len(hits) + 0.5))
-        for doc in hits:
-            bag = bags[doc]
-            frequency = bag[term]
-            size = sum(bag.values())
-            scores[doc] = scores.get(doc, 0.0) + idf * frequency * (k1 + 1) / (
-                frequency + k1 * (1 - b + b * size / average))
-    return sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+# 单独出现不说明话题相关的常见中文二元组与英文虚词；关键词通道只按其余词计分。
+_STOP_TERMS = frozenset((
+    "怎么 什么 这个 那个 一个 一下 一些 我们 你们 他们 可以 需要 就是 还是 没有 不是 现在 今天 如果 因为 所以 但是 "
+    "然后 已经 时候 知道 觉得 帮我 这样 那样 的话 是不 不要 应该 一样 还有 看看 问题 东西 时间 自己 大家 记得 刚才 "
+    "the a an is are was to of and or in on for at it this that be with as by from i you we my your me do does "
+    "how what can please"
+).split())
 
 
-def surfaceable(texts: Mapping[str, str], folder: str | None) -> dict[str, str]:
+# 一篇主题的检索单元：首个单元是“文件名 + description”，其余每条 '- ' 条目各一个；没有条目的散文按原文兜底展示。
+@dataclass(frozen=True, slots=True)
+class Surfaceable:
+    slug: str
+    description: str
+    rows: tuple[str, ...]
+    body: str
+
+    def units(self) -> tuple[str, ...]:
+        return (f"{self.slug} {self.description}".strip(), *(row[2:].strip() for row in self.rows))
+
+    def text(self) -> str:
+        return "\n".join((*self.units(), *(() if self.rows else (self.body,))))
+
+
+def surfaceable(texts: Mapping[str, str], folder: str | None) -> dict[str, Surfaceable]:
     prefixes = (f"{TOPICS}/", *((f"{TOPICS}/{folder}/",) if folder is not None else ()))
-    result: dict[str, str] = {}
+    result: dict[str, Surfaceable] = {}
     for doc, text in texts.items():
         if not any(doc.startswith(prefix) and "/" not in doc.removeprefix(prefix) for prefix in prefixes):
             continue
         fields, body = split_frontmatter(text)
         if doc.endswith(SCOPE_FILE) or fields.get("pinned", "").lower() == "true":
             continue
-        result[doc] = fields.get("description", "") + "\n" + "\n".join(body)
+        slug = doc.rsplit("/", 1)[-1].removesuffix(".md").replace("-", " ")
+        rows = tuple(row for row in body if row.startswith("- ") and row[2:].strip())
+        result[doc] = Surfaceable(slug, fields.get("description", ""), rows, "\n".join(body).strip())
     return result
+
+
+def row_matches(query: str, rows: tuple[str, ...]) -> tuple[float, ...]:
+    """每条条目命中的不同查询词个数（停用词除外），供关键词通道挑选展示哪几条。"""
+    wanted = {term for term in terms(query) if term not in _STOP_TERMS}
+    return tuple(float(len(wanted.intersection(terms(row)))) for row in rows)
+
+
+def lexical(query: str, docs: Mapping[str, str], *, k1: float = 1.2,
+            b: float = 0.75) -> dict[str, tuple[float, int]]:
+    """BM25 得分与命中的不同查询词个数；停用词不计分。"""
+    wanted = {term for term in terms(query) if term not in _STOP_TERMS}
+    bags = {doc: Counter(terms(text)) for doc, text in docs.items()}
+    sizes = {doc: sum(bag.values()) for doc, bag in bags.items()}
+    average = sum(sizes.values()) / len(bags) if bags else 1.0
+    result: dict[str, tuple[float, int]] = {}
+    for term in wanted:
+        hits = [doc for doc, bag in bags.items() if term in bag]
+        idf = math.log(1 + (len(bags) - len(hits) + 0.5) / (len(hits) + 0.5))
+        for doc in hits:
+            frequency = bags[doc][term]
+            score, matched = result.get(doc, (0.0, 0))
+            result[doc] = (score + idf * frequency * (k1 + 1) / (
+                frequency + k1 * (1 - b + b * sizes[doc] / (average or 1.0))), matched + 1)
+    return result
+
+
+_K = TypeVar("_K", bound=Hashable)
+
+
+# 与任何记忆都无关的参照句：和主题条目一起给出“本次查询的无关水平”，记忆很少时基线也稳。
+ANCHORS = (
+    "今天下午的天气预报说会下雨", "这家餐厅的招牌菜是红烧肉", "火车站的候车大厅里人很多", "这本小说讲一个航海家的故事",
+    "The quarterly report shows steady growth in sales.", "She practices the violin every evening.",
+    "The museum is closed on Mondays for maintenance.", "A recipe for banana bread with walnuts.",
+)
+
+
+def relevance(similarities: Mapping[_K, float], anchors: tuple[float, ...]) -> tuple[float, dict[_K, float]]:
+    """把余弦相似度换成相对本次查询无关水平的相关度：(s - 基线) / max(1 - 基线, 0.5)，基线取全部单元与参照句的中位数。
+    分母设下限：查询和无关内容都很像（基线高）时不放大噪声，过线仍须真正高出基线。"""
+    values = sorted((*similarities.values(), *anchors))
+    baseline = values[len(values) // 2] if values else 0.0
+    scale = max(1.0 - baseline, 0.5)
+    return baseline, {key: (value - baseline) / scale for key, value in similarities.items()}
+
+
+def choose(dense: Mapping[str, float] | None, words: Mapping[str, tuple[float, int]], *, limit: int,
+           min_relevance: float, min_score: float) -> list[str]:
+    """向量通道按相关度过线；关键词通道须命中至少两个不同的词且分数过线；两路名次按 RRF 融合排序。"""
+    qualified = {doc for doc, score in (dense or {}).items() if score >= min_relevance}
+    qualified |= {doc for doc, (score, matched) in words.items() if matched >= 2 and score >= min_score}
+    ranks: list[dict[str, int]] = []
+    for scores in ((dense or {}), {doc: value[0] for doc, value in words.items()}):
+        ranks.append({doc: index for index, doc in enumerate(sorted(scores, key=lambda key: (-scores[key], key)))})
+    fused = {doc: sum(1.0 / (60 + rank[doc]) for rank in ranks if doc in rank) for doc in qualified}
+    return sorted(qualified, key=lambda doc: (-fused[doc], doc))[:limit]
+
+
+def pick_rows(rows: tuple[str, ...], scores: tuple[float, ...], *, floor: float, chars: int,
+              entries: int) -> tuple[str, ...]:
+    """挑相关度不低于 floor 的最多 entries 条、总长不超过 chars 的条目，按文件原顺序给出；
+    没有条目过线（主题凭文件名或描述命中）时给开头几条。"""
+    order = sorted((index for index in range(len(rows)) if scores[index] >= floor),
+                   key=lambda index: (-scores[index], index))
+    if not order:
+        order = list(range(len(rows)))
+    chosen: list[int] = []
+    used = 0
+    for index in order[:entries]:
+        if chosen and used + len(rows[index]) > chars:
+            continue
+        chosen.append(index)
+        used += len(rows[index])
+    return tuple(rows[index] if len(rows[index]) <= chars else rows[index][:chars] + "…" for index in sorted(chosen))
